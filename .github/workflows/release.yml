@@ -1,0 +1,47 @@
+name: Release cloud189-webdav
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build linux-amd64-v3
+        run: |
+          TAG_NAME="v$(date +'%y.%m.%d')"
+          ARTIFACT_NAME="cloud189-webdav-linux-amd64-v3"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=${ARTIFACT_NAME}" >> "$GITHUB_ENV"
+
+          mkdir -p release
+          GOOS=linux GOARCH=amd64 GOAMD64=v3 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w -buildid=" \
+            -o "release/${ARTIFACT_NAME}" .
+
+          cd release
+          zip "${ARTIFACT_NAME}.zip" "${ARTIFACT_NAME}" ../README.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: cloud189-webdav ${{ env.TAG_NAME }}
+          tag_name: ${{ env.TAG_NAME }}
+          files: ./release/${{ env.ARTIFACT_NAME }}.zip
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
