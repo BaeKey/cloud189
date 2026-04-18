@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"github.com/go-resty/resty/v2"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -40,34 +42,59 @@ const (
 	pcName      = "TELEPC"
 	channelID   = "web_cloud.189.cn"
 	httpTimeout = 10 * time.Second
+
+	// 重试退避参数
+	maxRetries     = 3
+	retryBaseDelay = 1 * time.Second
+
+	// 默认限流：5 次/秒，突发 10 次
+	defaultRateLimit = 5
+	defaultRateBurst = 10
+)
+
+// 预编译正则，避免每次调用都重新编译。
+var (
+	reCaptchaToken = regexp.MustCompile(`'captchaToken' value='(.+?)'`)
+	reLt           = regexp.MustCompile(`lt = "(.+?)"`)
+	reParamId      = regexp.MustCompile(`paramId = "(.+?)"`)
+	reReqId        = regexp.MustCompile(`reqId = "(.+?)"`)
+	reURLPath      = regexp.MustCompile(`://[^/]+((/[^/\s?#]+)*)`)
 )
 
 var ErrNotFound = errors.New("not found")
 
 // Cloud189Client 封装天翼云盘登录态和 API 调用。
 type Cloud189Client struct {
-	cfg    Cloud189Config
-	client *resty.Client
-
+	cfg       Cloud189Config
+	client    *resty.Client
 	mu        sync.Mutex
 	token     *AppSessionResp
 	loginBase *BaseLoginParam
 	statePath string
 	state     Cloud189State
+	limiter   *rate.Limiter // API 请求限流器
 }
 
-// NewCloud189Client 创建客户端并在启动阶段完成一次登录/续期，确保服务可用后再对外提供 WebDAV。
-func NewCloud189Client(cfg Cloud189Config, statePath string) (*Cloud189Client, error) {
+// NewCloud189Client 创建客户端并在启动阶段完成一次登录/续期。
+func NewCloud189Client(cfg Cloud189Config, statePath string, rateLimit int, rateBurst int) (*Cloud189Client, error) {
 	if cfg.Type == "" {
 		cfg.Type = "personal"
 	}
 	if cfg.RootFolderID == "" && cfg.Type == "personal" {
 		cfg.RootFolderID = "-11"
 	}
+	if rateLimit <= 0 {
+		rateLimit = defaultRateLimit
+	}
+	if rateBurst <= 0 {
+		rateBurst = defaultRateBurst
+	}
+
 	jar, _ := cookiejar.New(nil)
 	c := &Cloud189Client{
 		cfg:       cfg,
 		statePath: statePath,
+		limiter:   rate.NewLimiter(rate.Limit(rateLimit), rateBurst),
 		client: resty.New().
 			SetTimeout(httpTimeout).
 			SetCookieJar(jar).
@@ -89,6 +116,7 @@ func NewCloud189Client(cfg Cloud189Config, statePath string) (*Cloud189Client, e
 		}
 		c.cfg.FamilyID = familyID
 	}
+	logInfo("[cloud189] login ok, type=%s", c.cfg.Type)
 	return c, nil
 }
 
@@ -102,7 +130,6 @@ func (c *Cloud189Client) RootEntry() Entry {
 }
 
 // List 读取目录下一级子项列表。
-// 调用方主要是 PathCache.listDir，正常情况下目录扫描都会经过这里。
 func (c *Cloud189Client) List(ctx context.Context, folderID string) ([]Entry, error) {
 	if err := c.ensureSession(ctx); err != nil {
 		return nil, err
@@ -141,7 +168,6 @@ func (c *Cloud189Client) List(ctx context.Context, folderID string) ([]Entry, er
 }
 
 // DirectLink 为文件申请真实下载地址。
-// 调用方只有 handleRead 的 GET 路径，HEAD 不会调用它。
 func (c *Cloud189Client) DirectLink(ctx context.Context, fileID string) (string, error) {
 	if err := c.ensureSession(ctx); err != nil {
 		return "", err
@@ -167,11 +193,14 @@ func (c *Cloud189Client) DirectLink(ctx context.Context, fileID string) (string,
 	}, &download, isFamily); err != nil {
 		return "", err
 	}
-	return strings.Replace(strings.ReplaceAll(download.URL, "&amp;", "&"), "http://", "https://", 1), nil
+
+	// 使用 html.UnescapeString 处理所有 HTML 实体，并强制 HTTPS
+	link := html.UnescapeString(download.URL)
+	link = strings.Replace(link, "http://", "https://", 1)
+	return link, nil
 }
 
 // ensureSession 确保当前请求拥有可用登录态。
-// 对于 rclone 挂载场景，这里只保证本地内存里已有令牌，不主动探测远端会话。
 func (c *Cloud189Client) ensureSession(ctx context.Context) error {
 	c.mu.Lock()
 	hasToken := c.token != nil
@@ -196,15 +225,16 @@ func (c *Cloud189Client) reauthenticateLocked(ctx context.Context) error {
 	if c.state.RefreshToken != "" {
 		c.token = &AppSessionResp{RefreshToken: c.state.RefreshToken}
 		if err := c.refreshToken(ctx); err == nil {
+			logDebug("[cloud189] session restored via refresh token")
 			return nil
 		}
 		c.token = nil
+		logInfo("[cloud189] refresh token expired, falling back to password login")
 	}
 	return c.loginByPassword(ctx)
 }
 
 // loginByPassword 使用账号密码执行完整登录流程。
-// 当 refresh token 不可用或失效时，ensureSession 会回退到这里。
 func (c *Cloud189Client) loginByPassword(ctx context.Context) error {
 	if c.cfg.Username == "" || c.cfg.Password == "" {
 		return errors.New("cloud189 username/password is required")
@@ -262,11 +292,11 @@ func (c *Cloud189Client) loginByPassword(ctx context.Context) error {
 		return errors.New(token.ResMessage)
 	}
 	c.token = &token
+	logInfo("[cloud189] password login ok")
 	return c.storeRefreshToken(token.RefreshToken)
 }
 
 // refreshSession 用 access token 刷新会话细节。
-// 如果云端返回 open token 无效，会继续尝试 refreshToken。
 func (c *Cloud189Client) refreshSession(ctx context.Context) error {
 	var errResp RespErr
 	var session UserSessionResp
@@ -314,6 +344,7 @@ func (c *Cloud189Client) refreshToken(ctx context.Context) error {
 		return err
 	}
 	if errResp.HasError() {
+		logWarn("[cloud189] refresh token failed: %s, falling back to password", errResp.Error())
 		return c.loginByPassword(ctx)
 	}
 	c.token = &token
@@ -391,24 +422,36 @@ func (c *Cloud189Client) listFilesPage(ctx context.Context, folderID string, pag
 
 // get 是 GET 请求的便捷包装。
 func (c *Cloud189Client) get(fullURL string, callback func(*resty.Request), resp any, isFamily bool) ([]byte, error) {
-	return c.request(fullURL, http.MethodGet, callback, nil, resp, isFamily, false)
+	return c.request(fullURL, http.MethodGet, callback, nil, resp, isFamily, 0)
 }
 
 // request 是所有云盘 API 的统一入口：
-// 1. 挂鉴权头
-// 2. 发请求
-// 3. 发现会话失效时触发一次被动续期
-// 4. 成功后返回原始响应体
-func (c *Cloud189Client) request(fullURL, method string, callback func(*resty.Request), params Params, resp any, isFamily bool, retried bool) ([]byte, error) {
+//  1. 限流等待
+//  2. 挂鉴权头
+//  3. 发请求
+//  4. 发现会话失效时触发一次被动续期
+//  5. 瞬态错误时指数退避重试
+func (c *Cloud189Client) request(fullURL, method string, callback func(*resty.Request), params Params, resp any, isFamily bool, retryCount int) ([]byte, error) {
 	if c.token == nil {
 		return nil, errors.New("not logged in")
 	}
+
+	// 限流等待
+	if err := c.limiter.Wait(context.Background()); err != nil {
+		return nil, fmt.Errorf("rate limiter: %w", err)
+	}
+
 	req := c.client.R().SetQueryParams(clientSuffix())
 	paramData := c.encryptParams(params, isFamily)
 	if paramData != "" {
 		req.SetQueryParam("params", paramData)
 	}
-	req.SetHeaders(c.signatureHeader(fullURL, method, paramData, isFamily))
+	sigHeaders, err := c.signatureHeader(fullURL, method, paramData, isFamily)
+	if err != nil {
+		return nil, fmt.Errorf("signature: %w", err)
+	}
+	req.SetHeaders(sigHeaders)
+
 	var errResp RespErr
 	req.SetError(&errResp)
 	if callback != nil {
@@ -419,19 +462,39 @@ func (c *Cloud189Client) request(fullURL, method string, callback func(*resty.Re
 	}
 	res, err := req.Execute(method, fullURL)
 	if err != nil {
+		// 网络错误，尝试指数退避重试
+		if retryCount < maxRetries {
+			delay := retryBaseDelay * time.Duration(1<<uint(retryCount))
+			logWarn("[cloud189] request failed (retry %d/%d, wait %v): %v", retryCount+1, maxRetries, delay, err)
+			time.Sleep(delay)
+			return c.request(fullURL, method, callback, params, resp, isFamily, retryCount+1)
+		}
 		return nil, err
 	}
+
 	body := res.Body()
+
+	// 检测会话失效
 	if strings.Contains(string(body), "userSessionBO is null") || strings.Contains(string(body), "InvalidSessionKey") {
-		if retried {
-			return nil, errors.New("cloud189 session invalid after reauthentication")
+		if retryCount >= maxRetries {
+			return nil, errors.New("cloud189 session invalid after max retries")
 		}
+		logInfo("[cloud189] session expired, reauthenticating")
 		c.invalidateSession()
 		if err := c.reauthenticate(req.Context()); err != nil {
 			return nil, err
 		}
-		return c.request(fullURL, method, callback, params, resp, isFamily, true)
+		return c.request(fullURL, method, callback, params, resp, isFamily, retryCount+1)
 	}
+
+	// 服务端 5xx 错误，指数退避重试
+	if res.StatusCode() >= 500 && retryCount < maxRetries {
+		delay := retryBaseDelay * time.Duration(1<<uint(retryCount))
+		logWarn("[cloud189] server error %d (retry %d/%d, wait %v)", res.StatusCode(), retryCount+1, maxRetries, delay)
+		time.Sleep(delay)
+		return c.request(fullURL, method, callback, params, resp, isFamily, retryCount+1)
+	}
+
 	if errResp.HasError() {
 		return nil, &errResp
 	}
@@ -439,6 +502,7 @@ func (c *Cloud189Client) request(fullURL, method string, callback func(*resty.Re
 }
 
 // initLoginParam 拉取登录页和加密参数，为密码登录准备 RSA 密文。
+// extractField 在匹配失败时返回错误，方便定位天翼改版导致的问题。
 func (c *Cloud189Client) initLoginParam(ctx context.Context) error {
 	jar, _ := cookiejar.New(nil)
 	c.client.SetCookieJar(jar)
@@ -455,11 +519,22 @@ func (c *Cloud189Client) initLoginParam(ctx context.Context) error {
 		return err
 	}
 	page := res.String()
-	baseParam := &BaseLoginParam{
-		CaptchaToken: mustMatch(page, `'captchaToken' value='(.+?)'`),
-		Lt:           mustMatch(page, `lt = "(.+?)"`),
-		ParamID:      mustMatch(page, `paramId = "(.+?)"`),
-		ReqID:        mustMatch(page, `reqId = "(.+?)"`),
+
+	captchaToken, err := extractField(page, reCaptchaToken, "captchaToken")
+	if err != nil {
+		return err
+	}
+	lt, err := extractField(page, reLt, "lt")
+	if err != nil {
+		return err
+	}
+	paramID, err := extractField(page, reParamId, "paramId")
+	if err != nil {
+		return err
+	}
+	reqID, err := extractField(page, reReqId, "reqId")
+	if err != nil {
+		return err
 	}
 
 	var encryptConf EncryptConfResp
@@ -473,14 +548,30 @@ func (c *Cloud189Client) initLoginParam(ctx context.Context) error {
 		return err
 	}
 	publicKey := fmt.Sprintf("-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----", encryptConf.Data.PubKey)
-	baseParam.RSAUsername = encryptConf.Data.Pre + rsaEncrypt(publicKey, c.cfg.Username)
-	baseParam.RSAPassword = encryptConf.Data.Pre + rsaEncrypt(publicKey, c.cfg.Password)
-	c.loginBase = baseParam
+	c.loginBase = &BaseLoginParam{
+		CaptchaToken: captchaToken,
+		Lt:           lt,
+		ParamID:      paramID,
+		ReqID:        reqID,
+		RSAUsername:  encryptConf.Data.Pre + rsaEncrypt(publicKey, c.cfg.Username),
+		RSAPassword:  encryptConf.Data.Pre + rsaEncrypt(publicKey, c.cfg.Password),
+	}
 	return nil
 }
 
+// extractField 从登录页 HTML 中提取指定字段。
+// 匹配失败时返回明确错误，方便定位天翼改版导致的问题。
+func extractField(body string, re *regexp.Regexp, fieldName string) (string, error) {
+	match := re.FindStringSubmatch(body)
+	if len(match) < 2 || match[1] == "" {
+		return "", fmt.Errorf("cloud189 login page missing field %q (pattern %s)", fieldName, re.String())
+	}
+	return match[1], nil
+}
+
 // signatureHeader 生成天翼云盘接口要求的签名请求头。
-func (c *Cloud189Client) signatureHeader(fullURL, method, params string, isFamily bool) map[string]string {
+// 增加 panic 保护：URL 不匹配正则时返回错误而非崩溃。
+func (c *Cloud189Client) signatureHeader(fullURL, method, params string, isFamily bool) (map[string]string, error) {
 	dateOfGMT := time.Now().UTC().Format(http.TimeFormat)
 	sessionKey := c.token.SessionKey
 	sessionSecret := c.token.SessionSecret
@@ -488,12 +579,16 @@ func (c *Cloud189Client) signatureHeader(fullURL, method, params string, isFamil
 		sessionKey = c.token.FamilySessionKey
 		sessionSecret = c.token.FamilySessionSecret
 	}
+	sig, err := signatureOfHMAC(sessionSecret, sessionKey, method, fullURL, dateOfGMT, params)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]string{
 		"Date":         dateOfGMT,
 		"SessionKey":   sessionKey,
 		"X-Request-ID": uuid.NewString(),
-		"Signature":    signatureOfHMAC(sessionSecret, sessionKey, method, fullURL, dateOfGMT, params),
-	}
+		"Signature":    sig,
+	}, nil
 }
 
 // encryptParams 对 params 做接口要求的 AES 加密。
@@ -520,28 +615,49 @@ func clientSuffix() map[string]string {
 }
 
 // signatureOfHMAC 计算接口签名。
-func signatureOfHMAC(sessionSecret, sessionKey, method, fullURL, dateOfGMT, params string) string {
-	urlPath := regexp.MustCompile(`://[^/]+((/[^/\s?#]+)*)`).FindStringSubmatch(fullURL)[1]
+// 增加 panic 保护：URL 不匹配正则时返回错误而非崩溃。
+func signatureOfHMAC(sessionSecret, sessionKey, method, fullURL, dateOfGMT, params string) (string, error) {
+	matches := reURLPath.FindStringSubmatch(fullURL)
+	if len(matches) < 2 {
+		return "", fmt.Errorf("invalid URL for signature: %s", fullURL)
+	}
+	urlPath := matches[1]
 	mac := hmac.New(sha1.New, []byte(sessionSecret))
 	data := fmt.Sprintf("SessionKey=%s&Operate=%s&RequestURI=%s&Date=%s", sessionKey, method, urlPath, dateOfGMT)
 	if params != "" {
 		data += "&params=" + params
 	}
 	mac.Write([]byte(data))
-	return strings.ToUpper(hex.EncodeToString(mac.Sum(nil)))
+	return strings.ToUpper(hex.EncodeToString(mac.Sum(nil))), nil
 }
 
 // rsaEncrypt 使用服务端下发的公钥加密用户名和密码。
 func rsaEncrypt(publicKey, plain string) string {
 	block, _ := pem.Decode([]byte(publicKey))
-	pub, _ := x509.ParsePKIXPublicKey(block.Bytes)
-	cipher, _ := rsa.EncryptPKCS1v15(rand.Reader, pub.(*rsa.PublicKey), []byte(plain))
+	if block == nil {
+		logError("[cloud189] RSA: failed to decode PEM block")
+		return ""
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		logError("[cloud189] RSA: failed to parse public key: %v", err)
+		return ""
+	}
+	cipher, err := rsa.EncryptPKCS1v15(rand.Reader, pub.(*rsa.PublicKey), []byte(plain))
+	if err != nil {
+		logError("[cloud189] RSA: encryption failed: %v", err)
+		return ""
+	}
 	return strings.ToUpper(hex.EncodeToString(cipher))
 }
 
 // aesECBEncrypt 以接口约定的 ECB 方式加密参数串。
 func aesECBEncrypt(data, key string) string {
-	block, _ := aes.NewCipher([]byte(key))
+	block, err := aes.NewCipher([]byte(key))
+	if err != nil {
+		logError("[cloud189] AES: cipher creation failed: %v", err)
+		return ""
+	}
 	padding := block.BlockSize() - len(data)%block.BlockSize()
 	padded := append([]byte(data), bytes.Repeat([]byte{byte(padding)}, padding)...)
 	encrypted := make([]byte, len(padded))
@@ -557,14 +673,7 @@ func timestamp() int64 {
 	return time.Now().UTC().UnixNano() / 1e6
 }
 
-// mustMatch 从登录页 HTML/JS 中提取指定字段。
-func mustMatch(body, pattern string) string {
-	match := regexp.MustCompile(pattern).FindStringSubmatch(body)
-	if len(match) < 2 {
-		return ""
-	}
-	return match[1]
-}
+// ---------- 数据结构 ----------
 
 // BaseLoginParam 保存密码登录前置接口解析出的参数。
 type BaseLoginParam struct {
@@ -634,7 +743,7 @@ func (e *RespErr) Error() string {
 	return "cloud189 request failed"
 }
 
-// UserSessionResp / AppSessionResp / Cloud189FilesResp 等结构用于承接接口响应。
+// UserSessionResp / AppSessionResp 等结构用于承接接口响应。
 type UserSessionResp struct {
 	ResCode             int    `json:"res_code"`
 	ResMessage          string `json:"res_message"`
@@ -651,7 +760,7 @@ type AppSessionResp struct {
 	RefreshToken string `json:"refreshToken"`
 }
 
-// Cloud189State 保存程序自动续期所需的内部状态，不暴露给常规用户配置。
+// Cloud189State 保存程序自动续期所需的内部状态。
 type Cloud189State struct {
 	RefreshToken string `json:"refresh_token"`
 }

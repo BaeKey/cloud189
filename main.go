@@ -2,15 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"mime"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -19,10 +22,72 @@ import (
 	"time"
 )
 
+// ---------- 日志等级系统 ----------
+
+// LogLevel 日志等级：0=ERROR, 1=WARN, 2=INFO, 3=DEBUG
+type LogLevel int
+
+const (
+	LogError LogLevel = iota
+	LogWarn
+	LogInfo
+	LogDebug
+)
+
+var currentLogLevel = LogInfo // 默认 INFO
+
+func parseLogLevel(s string) LogLevel {
+	switch strings.ToLower(s) {
+	case "error":
+		return LogError
+	case "warn", "warning":
+		return LogWarn
+	case "info":
+		return LogInfo
+	case "debug":
+		return LogDebug
+	default:
+		return LogInfo
+	}
+}
+
+func logLevelName(l LogLevel) string {
+	switch l {
+	case LogError:
+		return "ERROR"
+	case LogWarn:
+		return "WARN"
+	case LogInfo:
+		return "INFO"
+	case LogDebug:
+		return "DEBUG"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// logf 按等级输出日志。只有 msgLevel <= currentLogLevel 时才输出。
+func logf(msgLevel LogLevel, format string, args ...any) {
+	if msgLevel <= currentLogLevel {
+		log.Printf(format, args...)
+	}
+}
+
+// 便捷函数
+func logError(format string, args ...any) { logf(LogError, format, args...) }
+func logWarn(format string, args ...any)  { logf(LogWarn, format, args...) }
+func logInfo(format string, args ...any)  { logf(LogInfo, format, args...) }
+func logDebug(format string, args ...any) { logf(LogDebug, format, args...) }
+
+// ---------- 配置结构 ----------
+
 type Config struct {
-	Server   ServerConfig   `json:"server"`
-	Cloud189 Cloud189Config `json:"cloud189"`
-	Security SecurityConfig `json:"security"`
+	Server    ServerConfig    `json:"server"`
+	Cloud189  Cloud189Config  `json:"cloud189"`
+	Cache     CacheConfig     `json:"cache"`
+	RateLimit RateLimitConfig `json:"rate_limit"`
+	Security  SecurityConfig  `json:"security"`
+	Log       LogConfig       `json:"log"`
 }
 
 // ServerConfig 描述本地 WebDAV 服务监听参数。
@@ -40,10 +105,29 @@ type Cloud189Config struct {
 	RootFolderID string `json:"root_folder_id"`
 }
 
+// CacheConfig 描述目录和路径缓存的 TTL。
+type CacheConfig struct {
+	DirTTL   int `json:"dir_ttl_seconds"`   // 目录列表缓存秒数，默认 60
+	EntryTTL int `json:"entry_ttl_seconds"` // 路径全量缓存秒数，默认 300
+}
+
+// RateLimitConfig 描述 API 限流参数。
+type RateLimitConfig struct {
+	Rate  int `json:"rate"`  // 每秒请求数，默认 5
+	Burst int `json:"burst"` // 突发请求数，默认 10
+}
+
 // SecurityConfig 描述 root 启动后的降权目标。
 type SecurityConfig struct {
 	RunAsUID int `json:"run_as_uid"`
 	RunAsGID int `json:"run_as_gid"`
+}
+
+// LogConfig 描述日志输出策略。
+type LogConfig struct {
+	Level   string `json:"level"`    // 日志等级：error/warn/info/debug，默认 info
+	File    string `json:"file"`     // 日志文件路径，为空则只输出到 stderr
+	MaxSize int64  `json:"max_size"` // 单个日志文件最大字节数，默认 10MB
 }
 
 // Entry 是统一的目录项模型，被 WebDAV 响应和路径缓存共同使用。
@@ -62,44 +146,141 @@ type Server struct {
 	cache *PathCache
 }
 
-// main 是程序启动入口，顺序完成：加载配置、登录云盘、启动 WebDAV、最后降权常驻。
+// ---------- main ----------
+
 func main() {
 	cfg, configPath, statePath, err := LoadConfig()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	client, err := NewCloud189Client(cfg.Cloud189, statePath)
+
+	// 设置日志等级
+	currentLogLevel = parseLogLevel(cfg.Log.Level)
+
+	// 初始化日志输出（文件轮转）
+	if err := initLogger(cfg.Log); err != nil {
+		log.Fatalf("init logger: %v", err)
+	}
+
+	client, err := NewCloud189Client(cfg.Cloud189, statePath, cfg.RateLimit.Rate, cfg.RateLimit.Burst)
 	if err != nil {
 		log.Fatalf("init cloud189 client: %v", err)
 	}
+
+	dirTTL := time.Duration(cfg.Cache.DirTTL) * time.Second
+	entryTTL := time.Duration(cfg.Cache.EntryTTL) * time.Second
 	davPath := cleanBasePath(cfg.Server.BasePath)
 	srv := &Server{
 		dav:   davPath,
 		cloud: client,
-		cache: NewPathCache(),
+		cache: NewPathCache(dirTTL, entryTTL),
 	}
-	log.Printf("config: %s", configPath)
-	log.Printf("webdav: %s", publicDAVURL(cfg.Server.Listen, davPath))
-	log.Printf("cloud189 type: %s", cfg.Cloud189.Type)
-	server := &http.Server{
+
+	logInfo("[main] config: %s", configPath)
+	logInfo("[main] webdav: %s", publicDAVURL(cfg.Server.Listen, davPath))
+	logInfo("[main] cloud189 type: %s", cfg.Cloud189.Type)
+	logInfo("[main] cache: dir_ttl=%v entry_ttl=%v", dirTTL, entryTTL)
+	logInfo("[main] rate_limit: %d/s burst=%d", cfg.RateLimit.Rate, cfg.RateLimit.Burst)
+	logInfo("[main] log_level: %s", logLevelName(currentLogLevel))
+
+	httpServer := &http.Server{
 		Addr:              cfg.Server.Listen,
 		Handler:           srv.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+
 	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("serve http: %v", err)
 		}
 	}()
+
 	if err := maybeDropPrivileges(cfg.Security); err != nil {
 		log.Fatalf("drop privileges: %v", err)
 	}
-	select {}
+
+	// 优雅关闭
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	logInfo("[main] received %s, shutting down...", sig)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logError("[main] server shutdown error: %v", err)
+	}
+	logInfo("[main] server stopped")
 }
 
-// LoadConfig 从 ~/.config/cloud189/config.json 读取配置；首次启动会写入默认配置。
-// 同时会把旧版本遗留在 config.json 里的 refresh token 迁移到内部 state.json。
+// ---------- 日志初始化 ----------
+
+func initLogger(cfg LogConfig) error {
+	if cfg.File == "" {
+		return nil
+	}
+	maxSize := cfg.MaxSize
+	if maxSize <= 0 {
+		maxSize = 10 * 1024 * 1024
+	}
+	w, err := NewRotatingLogWriter(cfg.File, maxSize)
+	if err != nil {
+		return fmt.Errorf("open log file %s: %w", cfg.File, err)
+	}
+	log.SetOutput(w)
+	logInfo("[main] logging to %s (max_size=%dMB)", cfg.File, maxSize/1024/1024)
+	return nil
+}
+
+// RotatingLogWriter 实现基于文件大小的日志轮转。
+// 超过 maxSize 时，当前文件重命名为 .old（覆盖旧备份），然后创建新文件。
+// 只保留一个 .old 备份，不会日积月累过多。
+type RotatingLogWriter struct {
+	file    string
+	maxSize int64
+	fp      *os.File
+}
+
+func NewRotatingLogWriter(file string, maxSize int64) (*RotatingLogWriter, error) {
+	fp, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return nil, err
+	}
+	return &RotatingLogWriter{file: file, maxSize: maxSize, fp: fp}, nil
+}
+
+func (w *RotatingLogWriter) Write(p []byte) (int, error) {
+	n, err := w.fp.Write(p)
+	if err != nil {
+		return n, err
+	}
+	info, err := w.fp.Stat()
+	if err != nil {
+		return n, nil
+	}
+	if info.Size() >= w.maxSize {
+		w.rotate()
+	}
+	return n, nil
+}
+
+func (w *RotatingLogWriter) rotate() {
+	w.fp.Close()
+	_ = os.Rename(w.file, w.file+".old")
+	fp, err := os.OpenFile(w.file, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		log.SetOutput(os.Stderr)
+		logError("[main] log rotation failed: %v", err)
+		return
+	}
+	w.fp = fp
+}
+
+var _ io.Writer = (*RotatingLogWriter)(nil)
+
+// ---------- 配置加载 ----------
+
 func LoadConfig() (*Config, string, string, error) {
 	dir, err := os.UserHomeDir()
 	if err != nil {
@@ -136,7 +317,26 @@ func LoadConfig() (*Config, string, string, error) {
 	if cfg.Cloud189.RootFolderID == "" && cfg.Cloud189.Type == "personal" {
 		cfg.Cloud189.RootFolderID = "-11"
 	}
+	if cfg.Cache.DirTTL <= 0 {
+		cfg.Cache.DirTTL = 60
+	}
+	if cfg.Cache.EntryTTL <= 0 {
+		cfg.Cache.EntryTTL = 300
+	}
+	if cfg.RateLimit.Rate <= 0 {
+		cfg.RateLimit.Rate = defaultRateLimit
+	}
+	if cfg.RateLimit.Burst <= 0 {
+		cfg.RateLimit.Burst = defaultRateBurst
+	}
+	if cfg.Log.Level == "" {
+		cfg.Log.Level = "info"
+	}
+	if cfg.Log.MaxSize <= 0 {
+		cfg.Log.MaxSize = 10 * 1024 * 1024
+	}
 
+	// 迁移旧版 refresh token
 	var legacy struct {
 		Cloud189 struct {
 			RefreshToken string `json:"refresh_token"`
@@ -152,6 +352,7 @@ func LoadConfig() (*Config, string, string, error) {
 			}
 		}
 	}
+
 	normalized, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return nil, "", "", err
@@ -165,7 +366,6 @@ func LoadConfig() (*Config, string, string, error) {
 	return cfg, configPath, statePath, nil
 }
 
-// DefaultConfig 返回初始化配置文件时使用的默认值。
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
@@ -176,15 +376,27 @@ func DefaultConfig() *Config {
 			Type:         "personal",
 			RootFolderID: "-11",
 		},
+		Cache: CacheConfig{
+			DirTTL:   60,
+			EntryTTL: 300,
+		},
+		RateLimit: RateLimitConfig{
+			Rate:  defaultRateLimit,
+			Burst: defaultRateBurst,
+		},
 		Security: SecurityConfig{
 			RunAsUID: 65534,
 			RunAsGID: 65534,
 		},
+		Log: LogConfig{
+			Level:   "info",
+			MaxSize: 10 * 1024 * 1024,
+		},
 	}
 }
 
-// maybeDropPrivileges 在 root 启动时将进程切换到低权限用户。
-// 调用方只有 main，会在 WebDAV 服务启动后执行。
+// ---------- 降权 ----------
+
 func maybeDropPrivileges(cfg SecurityConfig) error {
 	if os.Geteuid() != 0 {
 		return nil
@@ -203,17 +415,16 @@ func maybeDropPrivileges(cfg SecurityConfig) error {
 			return fmt.Errorf("setuid %d: %w", uid, err)
 		}
 	}
-	log.Printf("privileges dropped to uid=%d gid=%d", os.Geteuid(), os.Getegid())
+	logInfo("[main] privileges dropped to uid=%d gid=%d", os.Geteuid(), os.Getegid())
 	return nil
 }
 
-// nobodyUIDGID 返回默认降权目标。
-// Linux 上通常 nobody/nogroup 对应 65534:65534，这里直接使用该惯例值，避免额外依赖系统账号查询。
 func nobodyUIDGID() (int, int) {
 	return 65534, 65534
 }
 
-// ReadJSON 读取 JSON 配置文件并反序列化到目标对象。
+// ---------- 通用 JSON 读写 ----------
+
 func ReadJSON(path string, out any) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -222,7 +433,6 @@ func ReadJSON(path string, out any) error {
 	return json.Unmarshal(data, out)
 }
 
-// WriteJSON 将对象按缩进格式写回配置文件，并限制为仅属主可读写。
 func WriteJSON(path string, in any) error {
 	data, err := json.MarshalIndent(in, "", "  ")
 	if err != nil {
@@ -232,7 +442,8 @@ func WriteJSON(path string, in any) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-// cleanBasePath 规范化 WebDAV 基础路径，空值时回退到 /dav。
+// ---------- 路径工具 ----------
+
 func cleanBasePath(p string) string {
 	if p == "" || p == "/" {
 		return "/dav"
@@ -240,7 +451,6 @@ func cleanBasePath(p string) string {
 	return path.Clean("/" + p)
 }
 
-// publicDAVURL 返回日志和文档里使用的无凭证 WebDAV 地址。
 func publicDAVURL(listenAddr, basePath string) string {
 	host := listenAddr
 	if strings.HasPrefix(host, ":") {
@@ -249,9 +459,16 @@ func publicDAVURL(listenAddr, basePath string) string {
 	return "http://" + host + cleanBasePath(basePath)
 }
 
-// routes 是整个 HTTP 服务的入口分发器，只暴露只读 WebDAV 能力。
+// ---------- HTTP 路由 ----------
+
+// routes 是整个 HTTP 服务的入口分发器，只暴露只读 WebDAV 能力 + 健康检查。
 func (s *Server) routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 健康检查端点（不在 /dav 前缀下）
+		if r.URL.Path == "/health" {
+			s.handleHealth(w, r)
+			return
+		}
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, s.dav+"/", http.StatusFound)
 			return
@@ -274,7 +491,31 @@ func (s *Server) routes() http.Handler {
 	})
 }
 
-// relativePath 将请求 URL 转成云盘内部使用的规范路径。
+// handleHealth 处理健康检查请求。
+// GET /health           → 返回服务状态和缓存统计
+// GET /health?invalidate=1 → 清空缓存，立即感知上游变更
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 支持清空缓存
+	if r.URL.Query().Get("invalidate") == "1" {
+		s.cache.Invalidate()
+	}
+
+	entries, dirs := s.cache.Stats()
+	result := map[string]any{
+		"status":      "ok",
+		"cache_entries": entries,
+		"cache_dirs":    dirs,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
 func (s *Server) relativePath(p string) string {
 	raw := strings.TrimPrefix(p, s.dav)
 	if raw == "" {
@@ -288,7 +529,6 @@ func (s *Server) relativePath(p string) string {
 	return cleaned
 }
 
-// handleOptions 响应 WebDAV 客户端的能力探测请求。
 func (s *Server) handleOptions(w http.ResponseWriter) {
 	w.Header().Set("DAV", "1")
 	w.Header().Set("Allow", "OPTIONS, PROPFIND, GET, HEAD")
@@ -296,10 +536,7 @@ func (s *Server) handleOptions(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleRead 处理 GET/HEAD：
-// 1. 先从缓存解析路径到文件项
-// 2. HEAD 只返回元信息
-// 3. GET 才向云盘申请真实下载链接并返回 302
+// handleRead 处理 GET/HEAD。
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	entryPath := s.relativePath(r.URL.Path)
@@ -323,9 +560,11 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 	link, err := s.cloud.DirectLink(ctx, entry.ID)
 	if err != nil {
+		logError("[webdav] direct link failed: path=%s id=%s err=%v", entryPath, entry.ID, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	logDebug("[webdav] redirect: path=%s → %s", entryPath, truncateURL(link, 80))
 	headers := w.Header()
 	headers.Del("Accept-Ranges")
 	headers.Del("Content-Type")
@@ -336,7 +575,13 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusFound)
 }
 
-// writeFileMetadataHeaders 把 Entry 转成下载响应头，供 GET/HEAD 共用。
+func truncateURL(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 func writeFileMetadataHeaders(w http.ResponseWriter, entry Entry) {
 	prop := newProp(entry)
 	headers := w.Header()
@@ -347,7 +592,6 @@ func writeFileMetadataHeaders(w http.ResponseWriter, entry Entry) {
 	headers.Set("Last-Modified", prop.GetLastModified)
 }
 
-// mimeType 根据扩展名推断 MIME，未知类型时回退为二进制流。
 func mimeType(name string) string {
 	if typ := mime.TypeByExtension(path.Ext(name)); typ != "" {
 		return typ
@@ -356,7 +600,6 @@ func mimeType(name string) string {
 }
 
 // handlePropfind 处理目录浏览请求。
-// Depth=0 返回当前项，Depth=1 会额外展开一级子目录内容。
 func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	entryPath := s.relativePath(r.URL.Path)
@@ -404,7 +647,6 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// href 把内部路径编码成 WebDAV 响应里的 Href。
 func (s *Server) href(entryPath string) string {
 	parts := strings.Split(strings.TrimPrefix(entryPath, "/"), "/")
 	for i, part := range parts {
@@ -421,7 +663,6 @@ func (s *Server) href(entryPath string) string {
 	return full
 }
 
-// propstat 为单个目录项构造 WebDAV 200 OK 属性块。
 func (s *Server) propstat(entry Entry) Propstat {
 	return Propstat{
 		Prop:   newProp(entry),
@@ -429,7 +670,6 @@ func (s *Server) propstat(entry Entry) Propstat {
 	}
 }
 
-// newProp 将内部 Entry 映射成 WebDAV 属性结构。
 func newProp(entry Entry) Prop {
 	mod := entry.ModifiedAt
 	if mod.IsZero() {
